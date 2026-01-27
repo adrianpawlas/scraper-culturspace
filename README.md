@@ -64,7 +64,23 @@ create table public.products (
 
 ## Configuration
 
-The scraper is pre-configured with your Supabase credentials. If you need to change them, edit the `SUPABASE_URL` and `SUPABASE_KEY` variables in the scripts.
+The scraper is pre-configured with your Supabase credentials. If you need to change them, edit the `SUPABASE_URL` and `SUPABASE_KEY` variables in the scripts, or set the environment variables `SUPABASE_URL` and `SUPABASE_KEY` (used by GitHub Actions).
+
+## GitHub Actions (daily + manual)
+
+The workflow [`.github/workflows/scrape.yml`](.github/workflows/scrape.yml) runs the full scraper:
+
+- **Schedule**: every day at **00:00 UTC**
+- **Manual run**: go to [Actions → Cultur Space Scraper](https://github.com/adrianpawlas/scraper-culturspace/actions) and click **Run workflow**
+
+**Required secrets** (repo **Settings → Secrets and variables → Actions**):
+
+| Name            | Value           |
+|-----------------|-----------------|
+| `SUPABASE_URL`  | Your Supabase project URL |
+| `SUPABASE_KEY`  | Your Supabase anon/service key |
+
+Add both, then the scheduled and manual runs will use them. If a run fails, the **scraper.log** is uploaded as an artifact for that run.
 
 ## Usage
 
