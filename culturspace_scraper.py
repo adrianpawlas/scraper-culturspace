@@ -201,7 +201,7 @@ class CulturSpaceScraper:
                 return None
 
             description = self._extract_description(soup)
-            price_info = self._extract_price_info(soup)
+            price_info = self._extract_price_info(soup, page_url=url)
             sizes = self._extract_sizes(soup)
             metadata = self._extract_metadata(soup, title, description, price_info)
 
@@ -380,72 +380,183 @@ class CulturSpaceScraper:
             logger.error(f"Error extracting description: {e}")
             return None
 
-    def _extract_price_info(self, soup: BeautifulSoup) -> Dict[str, Optional[str]]:
-        """Extract price and sale information in multiple currencies"""
+    def _extract_price_info(self, soup: BeautifulSoup, page_url: Optional[str] = None) -> Dict[str, Optional[str]]:
+        """Extract price and sale information in multiple currencies.
+        Cultur Space (Shopify) often shows USD ($); we accept EUR (€) or USD and convert to multi-currency.
+        When page_url is given, tries Shopify product JSON first (/products/{handle}.js) for accurate prices.
+        """
         try:
             price_info = {'price': None, 'sale': None}
-
-            # Extract the base EUR price first
             eur_price = None
             eur_sale = None
 
-            # Look for price elements - try multiple selectors
+            # 0) Shopify product JSON: reliable price/compare_at_price in cents (store currency)
+            if page_url:
+                handle = None
+                if '/products/' in page_url:
+                    handle = page_url.split('/products/')[-1].split('?')[0].strip('/')
+                if handle:
+                    try:
+                        js_url = f"{self.BASE_URL}/products/{handle}.js"
+                        r = self.session.get(js_url, timeout=10)
+                        if r.ok:
+                            data = r.json()
+                            v = data.get('variants') or []
+                            if v:
+                                p = v[0]
+                                # price in cents (Shopify)
+                                raw_price = p.get('price')
+                                raw_compare = p.get('compare_at_price')
+                                if raw_price is not None:
+                                    val = float(str(raw_price).replace(',', '.'))
+                                    # Shopify .js can return cents (e.g. 13317) or decimal (133.17)
+                                    if val >= 100 and val == int(val):
+                                        eur_price = round(val / 100 / 1.08, 2)
+                                    else:
+                                        eur_price = round(val / 1.08, 2)
+                                if raw_compare:
+                                    cv = float(str(raw_compare).replace(',', '.'))
+                                    if cv > 0:
+                                        if cv >= 100 and cv == int(cv):
+                                            eur_sale = round(cv / 100 / 1.08, 2)
+                                        else:
+                                            eur_sale = round(cv / 1.08, 2)
+                    except Exception:
+                        pass
+            # Match prices: $123.45 / €123.45 / 123.45$ / 123.45 USD (no thousands separator)
+            re_eur = re.compile(r'€\s*(\d{1,4}(?:[.,]\d{1,2})?)')
+            re_usd = re.compile(r'\$\s*(\d{1,4}(?:[.,]\d{1,2})?)')
+            re_usd_suffix = re.compile(r'(\d{1,4}(?:[.,]\d{1,2})?)\s*(?:\$|USD)')
+            re_plain_num = re.compile(r'(\d{1,4}(?:[.,]\d{1,2})?)')
+
+            def parse_amount(s: str) -> Optional[float]:
+                if not s or '..' in s or s.count('.') > 1:
+                    return None
+                s_clean = s.replace(',', '.')
+                m = re_plain_num.match(s_clean.strip())
+                if not m:
+                    return None
+                try:
+                    return float(m.group(1).replace(',', '.'))
+                except ValueError:
+                    return None
+
+            def parse_amount_from_group(g: str) -> Optional[float]:
+                """Parse a regex group; reject European thousands (e.g. 2.201.65)."""
+                if not g or len(g) > 12:
+                    return None
+                if g.count('.') > 1 or g.count(',') > 1:
+                    return None
+                if g.count('.') == 1 and g.count(',') == 0:
+                    parts = g.split('.')
+                    if len(parts) == 2 and len(parts[1]) <= 2 and len(parts[0]) <= 4:
+                        return float(g)
+                if g.count(',') == 1 and g.count('.') == 0:
+                    parts = g.split(',')
+                    if len(parts) == 2 and len(parts[1]) <= 2 and len(parts[0]) <= 4:
+                        return float(g.replace(',', '.'))
+                return None
+
+            # Plausible product price range (EUR): 3–2500. Reject noise (e.g. 1.45, 875 from "2.201.65").
+            def plausible_price(v: Optional[float]) -> bool:
+                return v is not None and 3 <= v <= 2500
+
+            # Prefer main product block to avoid picking cart/related prices
+            product_block = soup.find('main') or soup.find(class_=re.compile(r'product[^_]|product__info|product-single', re.I))
+            block_text = product_block.get_text() if product_block else soup.get_text()
+            full = block_text
+
+            # 1) Main block text: Cultur Space (Shopify) shows e.g. "$133.17" or "133.17 $" in body
+            all_usd = re_usd.findall(full)
+            all_usd_suffix = re_usd_suffix.findall(full)
+            all_eur = re_eur.findall(full)
+            usd_vals = [v for s in (all_usd + all_usd_suffix) for v in [parse_amount_from_group(s)] if plausible_price(v)]
+            if usd_vals and eur_price is None:
+                usd_dedup = sorted(set(usd_vals), reverse=True)
+                # Typical product price 10–500 USD; avoid cart totals or noise
+                typical = [v for v in usd_dedup if 10 <= v <= 500]
+                pick = typical[0] if typical else usd_dedup[0]
+                eur_price = round(pick / 1.08, 2)
+            if all_eur and eur_price is None:
+                v = parse_amount_from_group(all_eur[0])
+                if plausible_price(v):
+                    eur_price = v
+            if len(usd_vals) >= 2 and eur_sale is None:
+                vals = sorted(set(usd_vals), reverse=True)
+                typical_pair = [(a, b) for a, b in zip(vals, vals[1:]) if 10 <= b <= 500 and a > b]
+                if typical_pair and eur_sale is None:
+                    hi, lo = typical_pair[0]
+                    if eur_price is None:
+                        eur_price = round(hi / 1.08, 2)
+                    eur_sale = round(lo / 1.08, 2)
+                elif len(vals) >= 2 and vals[0] > vals[1] and vals[1] >= 3:
+                    if eur_price is None:
+                        eur_price = round(vals[0] / 1.08, 2)
+                    eur_sale = round(vals[1] / 1.08, 2)
+
+            # 2) Price-like elements (backup)
             price_selectors = [
-                'span.price',
-                '.product-price',
-                '[data-price]',
-                '.price-item'
+                'span.price', '.product-price', '[data-price]', '.price-item',
+                '[class*="price"]', '.product__price', '.price__regular', '.money',
             ]
-
-            for selector in price_selectors:
-                price_elem = soup.select_one(selector)
-                if price_elem:
-                    price_text = price_elem.get_text(strip=True)
-                    # Extract EUR price
-                    eur_match = re.search(r'€(\d+(?:[,.]\d+)*)', price_text)
-                    if eur_match:
-                        eur_price = float(eur_match.group(1).replace(',', '.'))
+            if eur_price is None or eur_sale is None:
+                for selector in price_selectors:
+                    for elem in soup.select(selector):
+                        txt = elem.get_text(strip=True)
+                        if not txt or len(txt) > 80:
+                            continue
+                        em = re_eur.search(txt)
+                        if em and eur_price is None:
+                            v = parse_amount_from_group(em.group(1))
+                            if plausible_price(v):
+                                eur_price = v
+                        um = re_usd.search(txt)
+                        if um and eur_price is None:
+                            usd_val = parse_amount_from_group(um.group(1))
+                            if plausible_price(usd_val):
+                                eur_price = round(usd_val / 1.08, 2)
+                        nums = [n for n in (parse_amount_from_group(m.group(1)) for m in re_plain_num.finditer(txt)) if plausible_price(n)]
+                        if len(nums) >= 2 and eur_sale is None:
+                            lo, hi = min(nums), max(nums)
+                            is_usd = '$' in txt or 'USD' in txt
+                            if eur_price is None and plausible_price(hi):
+                                eur_price = round(hi / 1.08, 2) if is_usd else hi
+                            if lo < hi and plausible_price(lo):
+                                eur_sale = round(lo / 1.08, 2) if is_usd else lo
+                        if eur_price is not None:
+                            break
+                    if eur_price is not None:
                         break
 
-            # Look for sale/discounted price
-            sale_selectors = [
-                'span.sale',
-                '.sale-price',
-                '.discounted-price',
-                '[data-sale-price]'
-            ]
-
-            for selector in sale_selectors:
-                sale_elem = soup.select_one(selector)
-                if sale_elem:
-                    sale_text = sale_elem.get_text(strip=True)
-                    eur_sale_match = re.search(r'€(\d+(?:[,.]\d+)*)', sale_text)
-                    if eur_sale_match:
-                        eur_sale = float(eur_sale_match.group(1).replace(',', '.'))
-                        break
-
-            # Fallback: look in JavaScript (Klaviyo/analytics) for Price, ImageURL
+            # 3) Scripts: Price/CompareAtPrice (Klaviyo-style) or JSON "price" (Shopify)
             if eur_price is None or eur_sale is None:
                 for script in soup.find_all('script'):
-                    if script.string and 'Price' in script.string:
-                        pm = re.search(r'Price:\s*["\']([^"\']+)["\']', script.string)
+                    if not script.string:
+                        continue
+                    t = script.string
+                    if 'Price' in t or 'price' in t:
+                        pm = re.search(r'Price:\s*["\']([^"\']+)["\']', t)
                         if pm and eur_price is None:
-                            s = pm.group(1)
-                            m = re.search(r'([\d,.]+)', s)
-                            if m:
-                                eur_price = float(m.group(1).replace(',', '.'))
-                        sm = re.search(r'CompareAtPrice:\s*["\']([^"\']+)["\']', script.string)
-                        if sm and sm.group(1) and '0' not in sm.group(1):
-                            s = sm.group(1)
-                            m = re.search(r'([\d,.]+)', s)
-                            if m:
-                                eur_sale = float(m.group(1).replace(',', '.'))
-                        break
+                            v = parse_amount_from_group(re.sub(r'[^\d.,]', '', pm.group(1)))
+                            if plausible_price(v):
+                                eur_price = round(v / 1.08, 2) if ('$' in pm.group(1) or 'USD' in pm.group(1)) else v
+                        sm = re.search(r'CompareAtPrice:\s*["\']([^"\']+)["\']', t)
+                        if sm and sm.group(1).strip() and '0' not in sm.group(1) and eur_sale is None:
+                            v = parse_amount_from_group(re.sub(r'[^\d.,]', '', sm.group(1)))
+                            if plausible_price(v):
+                                eur_sale = round(v / 1.08, 2) if ('$' in sm.group(1) or 'USD' in sm.group(1)) else v
+                    # Shopify JSON: "price":12300 (cents)
+                    if eur_price is None and '"price":' in t:
+                        pos = t.find('"price":')
+                        rest = t[pos + 7:].lstrip()
+                        cents = re.match(r'(\d+)', rest)
+                        if cents:
+                            eur_price = round(int(cents.group(1)) / 100 / 1.08, 2)
 
-            # If we found prices, convert to multiple currencies
-            if eur_price is not None:
+            # Convert to multi-currency string (required format)
+            if eur_price is not None and eur_price > 0:
                 price_info['price'] = self._eur_to_multi_currency(eur_price)
-            if eur_sale is not None and eur_sale > 0:
+            if eur_sale is not None and eur_sale > 0 and (eur_price is None or eur_sale < (eur_price or 0)):
                 price_info['sale'] = self._eur_to_multi_currency(eur_sale)
 
             return price_info
