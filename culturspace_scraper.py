@@ -24,19 +24,23 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 import torch
-from transformers import AutoProcessor, AutoModel
+from transformers import SiglipImageProcessor, SiglipModel
 from PIL import Image
 import numpy as np
-try:
-    from supabase import create_client, Client
-except ImportError:
+_supabase_client = None
+
+def _get_supabase_client(url: str, key: str):
+    """Use Supabase client if available; else None (caller uses REST fallback)."""
+    global _supabase_client
+    if _supabase_client is not None:
+        return _supabase_client
     try:
-        from supabase_py import create_client, Client
-    except ImportError:
-        # Fallback for older versions
-        import supabase
-        create_client = supabase.create_client
-        Client = supabase.Client
+        from supabase import create_client
+        _supabase_client = create_client(url, key)
+        return _supabase_client
+    except Exception:
+        return None
+
 from tqdm import tqdm
 import re
 
@@ -75,7 +79,9 @@ class CulturSpaceScraper:
     SECOND_HAND = False
 
     def __init__(self, supabase_url: str, supabase_key: str):
-        self.supabase: Client = create_client(supabase_url, supabase_key)
+        self._supabase_url = supabase_url.rstrip("/")
+        self._supabase_key = supabase_key
+        self._supabase = _get_supabase_client(supabase_url, supabase_key)
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -92,12 +98,13 @@ class CulturSpaceScraper:
         logger.info("CulturSpace Scraper initialized")
 
     def _init_embedding_model(self):
-        """Initialize the SigLIP model for image embeddings"""
+        """Initialize the SigLIP model for image embeddings (768-dim)"""
         try:
             logger.info("Loading SigLIP model...")
             model_name = "google/siglip-base-patch16-384"
-            self.processor = AutoProcessor.from_pretrained(model_name)
-            self.model = AutoModel.from_pretrained(model_name)
+            # Use image processor + full model to avoid AutoProcessor tokenizer/processor_config 404 path
+            self.processor = SiglipImageProcessor.from_pretrained(model_name)
+            self.model = SiglipModel.from_pretrained(model_name)
 
             # Move to GPU if available
             if torch.cuda.is_available():
@@ -619,7 +626,7 @@ class CulturSpaceScraper:
         """Generate 768-dimensional embedding from image URL"""
         try:
             # Download image
-            response = self.session.get(image_url, timeout=30)
+            response = self.session.get(image_url, timeout=60)
             response.raise_for_status()
 
             # Save to temporary file
@@ -631,25 +638,23 @@ class CulturSpaceScraper:
                 # Load and process image
                 image = Image.open(temp_path).convert('RGB')
 
-                # Process image
+                # Process image (SiglipImageProcessor returns pixel_values)
                 inputs = self.processor(images=image, return_tensors="pt")
 
                 if torch.cuda.is_available():
                     inputs = {k: v.cuda() for k, v in inputs.items()}
 
-                # Generate embedding (SigLIP vision encoder outputs 768-dim)
+                # Generate 768-dim embedding via SiglipModel.get_image_features
                 with torch.no_grad():
-                    outputs = self.model(**inputs)
-                    # SiglipModel / SiglipVisionModel: pooler_output or image_embeds or last_hidden_state
-                    if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
-                        embedding = outputs.pooler_output.squeeze().cpu().numpy()
-                    elif hasattr(outputs, 'image_embeds') and outputs.image_embeds is not None:
-                        embedding = outputs.image_embeds.squeeze().cpu().numpy()
-                    elif hasattr(outputs, 'last_hidden_state'):
-                        embedding = outputs.last_hidden_state[:, 0].squeeze().cpu().numpy()
+                    out = self.model.get_image_features(**inputs)
+                    # Handle tensor or BaseModelOutputWithPooling
+                    if hasattr(out, "pooler_output") and out.pooler_output is not None:
+                        embedding = out.pooler_output
+                    elif hasattr(out, "last_hidden_state"):
+                        embedding = out.last_hidden_state[:, 0]
                     else:
-                        logger.warning("Could not get embedding from model outputs")
-                        return None
+                        embedding = out
+                    embedding = embedding.squeeze().cpu().float().numpy()
 
                 # Ensure 768 dimensions
                 if len(embedding.shape) > 1:
@@ -695,11 +700,26 @@ class CulturSpaceScraper:
                 'size': product_data.size,
             }
 
-            # Insert or update
-            result = self.supabase.table('products').upsert(
-                data,
-                on_conflict='source,product_url'
-            ).execute()
+            if self._supabase is not None:
+                self._supabase.table('products').upsert(
+                    data, on_conflict='source,product_url'
+                ).execute()
+            else:
+                # REST fallback when supabase client fails (e.g. websockets.asyncio)
+                rest_url = f"{self._supabase_url}/rest/v1/products"
+                headers = {
+                    "apikey": self._supabase_key,
+                    "Authorization": f"Bearer {self._supabase_key}",
+                    "Content-Type": "application/json",
+                    "Prefer": "resolution=merge-duplicates,return=minimal",
+                }
+                resp = self.session.post(
+                    f"{rest_url}?on_conflict=source,product_url",
+                    headers=headers,
+                    json=data,
+                    timeout=30,
+                )
+                resp.raise_for_status()
 
             logger.info(f"Successfully saved product: {product_data.title}")
             return True
