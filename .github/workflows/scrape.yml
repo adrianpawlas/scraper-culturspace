@@ -48,6 +48,8 @@ jobs:
       - name: Run Cultur Space scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          # Service role key is required for inserting into products (bypasses RLS)
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
           SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
         run: python run_full_scraper.py
 

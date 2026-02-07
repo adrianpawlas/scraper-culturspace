@@ -24,7 +24,7 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from webdriver_manager.chrome import ChromeDriverManager
 import torch
-from transformers import SiglipImageProcessor, SiglipModel
+from transformers import SiglipImageProcessor, SiglipModel, SiglipTokenizer
 from PIL import Image
 import numpy as np
 _supabase_client = None
@@ -65,8 +65,11 @@ class ProductData:
     price: str
     sale: Optional[str]
     metadata: Optional[str]
-    embedding: List[float]
+    image_embedding: List[float]
+    info_embedding: List[float]
     size: Optional[str] = None
+    category: Optional[str] = None
+    additional_images: Optional[str] = None  # JSON array of URLs
 
 class CulturSpaceScraper:
     """Main scraper class for Cultur Space"""
@@ -90,21 +93,23 @@ class CulturSpaceScraper:
         # Initialize Selenium for JavaScript-heavy pages
         self.driver = None
 
-        # Initialize the image embedding model
+        # Initialize the image/text embedding model (SigLIP)
         self.processor = None
         self.model = None
+        self.tokenizer = None
         self._init_embedding_model()
 
         logger.info("CulturSpace Scraper initialized")
 
     def _init_embedding_model(self):
-        """Initialize the SigLIP model for image embeddings (768-dim)"""
+        """Initialize the SigLIP model for image and text embeddings (768-dim)"""
         try:
             logger.info("Loading SigLIP model...")
             model_name = "google/siglip-base-patch16-384"
             # Use image processor + full model to avoid AutoProcessor tokenizer/processor_config 404 path
             self.processor = SiglipImageProcessor.from_pretrained(model_name)
             self.model = SiglipModel.from_pretrained(model_name)
+            self.tokenizer = SiglipTokenizer.from_pretrained(model_name)
 
             # Move to GPU if available
             if torch.cuda.is_available():
@@ -195,7 +200,7 @@ class CulturSpaceScraper:
                 logger.warning(f"Could not extract title from {url}")
                 return None
 
-            image_url = self._extract_image_url(soup)
+            image_url, additional_urls = self._extract_images(soup)
             if not image_url:
                 logger.warning(f"Could not extract image URL from {url}")
                 return None
@@ -203,28 +208,42 @@ class CulturSpaceScraper:
             description = self._extract_description(soup)
             price_info = self._extract_price_info(soup, page_url=url)
             sizes = self._extract_sizes(soup)
+            category = self._extract_category(soup)
             metadata = self._extract_metadata(soup, title, description, price_info)
 
-            # Generate embedding from image
-            embedding = self._generate_image_embedding(image_url)
-
-            if not embedding:
-                logger.warning(f"Could not generate embedding for {url}")
+            # Generate image embedding from main image only
+            image_embedding = self._generate_image_embedding(image_url)
+            if not image_embedding:
+                logger.warning(f"Could not generate image embedding for {url}")
                 return None
+
+            # Build info text for text embedding (title, description, category, price, etc.)
+            info_parts = [title, description or "", category or "", price_info.get('price') or "", price_info.get('sale') or ""]
+            if sizes:
+                info_parts.append(" ".join(sizes))
+            info_parts.append(self.BRAND)
+            info_text = " ".join(str(p).strip() for p in info_parts if p)
+            info_embedding = self._generate_text_embedding(info_text)
+            if not info_embedding:
+                logger.warning(f"Could not generate info embedding for {url}")
+                return None
+
+            additional_images_json = json.dumps(additional_urls) if additional_urls else None
 
             product_data = ProductData(
                 product_url=url,
                 image_url=image_url,
                 title=title,
                 description=description,
-                price=price_info['price'],
-                sale=price_info['sale'],
+                price=price_info.get('price') or '',
+                sale=price_info.get('sale'),
                 metadata=metadata,
-                embedding=embedding
+                image_embedding=image_embedding,
+                info_embedding=info_embedding,
+                size=','.join(sizes) if sizes else None,
+                category=category,
+                additional_images=additional_images_json,
             )
-
-            # Add size information to the object for database storage
-            product_data.size = ','.join(sizes) if sizes else None
 
             logger.info(f"Successfully scraped: {title}")
             return product_data
@@ -254,78 +273,128 @@ class CulturSpaceScraper:
             logger.error(f"Error extracting title: {e}")
             return None
 
-    def _extract_image_url(self, soup: BeautifulSoup) -> Optional[str]:
-        """Extract product image URL"""
+    def _normalize_image_src(self, src: str) -> str:
+        """Convert relative image URL to absolute."""
+        if not src:
+            return src
+        if src.startswith('//'):
+            return 'https:' + src
+        if src.startswith('/'):
+            return urljoin(self.BASE_URL, src)
+        return src
+
+    def _extract_images(self, soup: BeautifulSoup) -> Tuple[Optional[str], List[str]]:
+        """Extract main product image URL and list of additional image URLs. Returns (main_url, additional_urls)."""
         try:
-            # Prefer ImageURL from JavaScript (Klaviyo/analytics) - matches live site
+            all_urls: List[str] = []
+            seen: set = set()
+
+            def add_url(url: str) -> bool:
+                url = self._normalize_image_src(url)
+                if not url or url in seen:
+                    return False
+                seen.add(url)
+                all_urls.append(url)
+                return True
+
+            # Prefer ImageURL from JavaScript (Klaviyo/analytics)
             for script in soup.find_all('script'):
                 if script.string and 'ImageURL' in script.string:
                     m = re.search(r'ImageURL:\s*["\']([^"\']+)["\']', script.string)
-                    if m:
-                        url = m.group(1)
-                        if url.startswith('//'):
-                            url = 'https:' + url
-                        elif url.startswith('/'):
-                            url = urljoin(self.BASE_URL, url)
-                        return url
+                    if m and add_url(m.group(1)):
+                        break
 
-            # Look for product images in various possible locations
+            # Collect from product gallery / images (often multiple)
             img_selectors = [
-                'img[data-image]',
                 '.product-gallery img',
                 '.product-images img',
                 '.product-image img',
+                'img[data-image]',
                 'img[alt*="product"]',
                 'img.product__image',
-                '.image-element img'
+                '.image-element img',
             ]
-
             for selector in img_selectors:
-                img_elem = soup.select_one(selector)
-                if img_elem:
-                    # Try data-image, data-src, or src attributes
-                    src = (img_elem.get('data-image') or
-                          img_elem.get('data-src') or
-                          img_elem.get('src'))
+                for img_elem in soup.select(selector):
+                    src = (img_elem.get('data-image') or img_elem.get('data-src') or img_elem.get('src'))
                     if src:
-                        # Convert relative URLs to absolute
-                        if src.startswith('//'):
-                            src = 'https:' + src
-                        elif src.startswith('/'):
-                            src = urljoin(self.BASE_URL, src)
-                        return src
+                        add_url(src)
 
-            # Fallback: look for any img tag with reasonable size
-            img_tags = soup.find_all('img')
-            for img in img_tags:
+            # Shopify / JSON in script: product.images or variants with images
+            for script in soup.find_all('script'):
+                if not script.string or 'images' not in script.string.lower():
+                    continue
+                # Match JSON arrays of image URLs
+                for m in re.finditer(r'"(https?://[^"]+\.(?:jpg|jpeg|png|webp)[^"]*)"', script.string):
+                    add_url(m.group(1))
+                for m in re.finditer(r'"//[^"]+\.(?:jpg|jpeg|png|webp)[^"]*"', script.string):
+                    add_url('https:' + m.group(0).strip('"'))
+
+            # Fallback: any img with reasonable size or product-like alt
+            for img in soup.find_all('img'):
                 src = img.get('src') or img.get('data-src')
-                if src:
-                    # Skip tiny images, icons, etc.
-                    width = img.get('width') or img.get('data-width')
-                    height = img.get('height') or img.get('data-height')
-                    if width and height:
-                        try:
-                            if int(width) > 200 and int(height) > 200:
-                                if src.startswith('//'):
-                                    src = 'https:' + src
-                                elif src.startswith('/'):
-                                    src = urljoin(self.BASE_URL, src)
-                                return src
-                        except (ValueError, TypeError):
-                            pass
+                if not src:
+                    continue
+                width = img.get('width') or img.get('data-width')
+                height = img.get('height') or img.get('data-height')
+                alt_text = (img.get('alt') or '').lower()
+                if width and height:
+                    try:
+                        if int(width) > 200 and int(height) > 200:
+                            add_url(src)
+                            continue
+                    except (ValueError, TypeError):
+                        pass
+                if any(k in alt_text for k in ['product', 'jacket', 'shirt', 'pants', 'tee', 'hoodie', 'short', 'cap']):
+                    add_url(src)
 
-                    # If no dimensions, check if it looks like a product image
-                    alt_text = img.get('alt', '').lower()
-                    if any(keyword in alt_text for keyword in ['product', 'jacket', 'shirt', 'pants', 'tee']):
-                        if src.startswith('//'):
-                            src = 'https:' + src
-                        elif src.startswith('/'):
-                            src = urljoin(self.BASE_URL, src)
-                        return src
+            if not all_urls:
+                return (None, [])
+            main_url = all_urls[0]
+            additional = [u for u in all_urls[1:] if u != main_url]
+            return (main_url, additional)
+        except Exception as e:
+            logger.error(f"Error extracting images: {e}")
+            return (None, [])
 
+    def _extract_category(self, soup: BeautifulSoup) -> Optional[str]:
+        """Extract product category/categories (e.g. 'Hoodies & Sweaters' -> 'Hoodies, Sweaters')."""
+        try:
+            # Breadcrumb: e.g. Home > Shop All > Hoodies & Sweaters
+            breadcrumbs = soup.select('[class*="breadcrumb"] a, nav a, .breadcrumb a, [aria-label="breadcrumb"] a')
+            for a in breadcrumbs:
+                text = a.get_text(strip=True)
+                if text and text.lower() not in ('home', 'shop', 'shop all', 'all') and len(text) > 1:
+                    # Normalize "Hoodies & Sweaters" -> "Hoodies, Sweaters"
+                    category = re.sub(r'\s*&\s*', ', ', text)
+                    if len(category) > 2:
+                        return category
+
+            # Collection links in product section
+            for a in soup.find_all('a', href=re.compile(r'/collections/')):
+                href = a.get('href', '')
+                if '/collections/shop-all' in href:
+                    continue
+                text = a.get_text(strip=True)
+                if text and len(text) > 2:
+                    category = re.sub(r'\s*&\s*', ', ', text)
+                    return category
+
+            # Meta or JSON-LD
+            for script in soup.find_all('script', {'type': 'application/ld+json'}):
+                try:
+                    data = json.loads(script.string)
+                    if isinstance(data, dict) and 'itemListElement' in data:
+                        for item in data.get('itemListElement', []):
+                            if isinstance(item, dict):
+                                name = item.get('name', '')
+                                if name and name.lower() not in ('home', 'shop all'):
+                                    return re.sub(r'\s*&\s*', ', ', name)
+                except (json.JSONDecodeError, TypeError):
+                    continue
             return None
         except Exception as e:
-            logger.error(f"Error extracting image URL: {e}")
+            logger.error(f"Error extracting category: {e}")
             return None
 
     def _extract_description(self, soup: BeautifulSoup) -> Optional[str]:
@@ -787,6 +856,48 @@ class CulturSpaceScraper:
             logger.error(f"Error generating embedding for {image_url}: {e}")
             return None
 
+    def _generate_text_embedding(self, text: str) -> Optional[List[float]]:
+        """Generate 768-dimensional text embedding using SigLIP text encoder (same model as image)."""
+        if not text or not text.strip():
+            return None
+        try:
+            # SigLIP tokenizer: use padding="max_length" and max_length=64 as per model training
+            inputs = self.tokenizer(
+                text.strip(),
+                padding="max_length",
+                max_length=64,
+                truncation=True,
+                return_tensors="pt",
+            )
+            if torch.cuda.is_available():
+                inputs = {k: v.cuda() for k, v in inputs.items()}
+
+            with torch.no_grad():
+                out = self.model.get_text_features(
+                    input_ids=inputs["input_ids"],
+                    attention_mask=inputs.get("attention_mask"),
+                )
+                # Handle tensor or BaseModelOutputWithPooling
+                if hasattr(out, "pooler_output") and out.pooler_output is not None:
+                    embedding = out.pooler_output
+                elif hasattr(out, "last_hidden_state"):
+                    embedding = out.last_hidden_state[:, 0]
+                else:
+                    embedding = out
+                embedding = embedding.squeeze().cpu().float().numpy()
+
+            if len(embedding.shape) > 1:
+                embedding = embedding.ravel()
+            if embedding.shape[0] != 768:
+                logger.warning(f"Text embedding dimension mismatch: {embedding.shape[0]}, expected 768")
+                return None
+
+            embedding = embedding.astype(np.float64) / np.linalg.norm(embedding)
+            return embedding.tolist()
+        except Exception as e:
+            logger.error(f"Error generating text embedding: {e}")
+            return None
+
     def save_to_supabase(self, product_data: ProductData) -> bool:
         """Save product data to Supabase"""
         try:
@@ -802,13 +913,16 @@ class CulturSpaceScraper:
                 'brand': self.BRAND,
                 'title': product_data.title,
                 'description': product_data.description,
+                'category': product_data.category,
                 'gender': self.GENDER,
                 'second_hand': self.SECOND_HAND,
-                'embedding': product_data.embedding,
+                'image_embedding': product_data.image_embedding,
+                'info_embedding': product_data.info_embedding,
                 'price': product_data.price,
                 'sale': product_data.sale,
                 'metadata': product_data.metadata,
                 'size': product_data.size,
+                'additional_images': product_data.additional_images,
             }
 
             if self._supabase is not None:

@@ -66,6 +66,8 @@ create table public.products (
 
 The scraper is pre-configured with your Supabase credentials. If you need to change them, edit the `SUPABASE_URL` and `SUPABASE_KEY` variables in the scripts, or set the environment variables `SUPABASE_URL` and `SUPABASE_KEY` (used by GitHub Actions).
 
+**Writing to the `products` table** requires a key that can insert/update rows. The scraper prefers `SUPABASE_SERVICE_ROLE_KEY` (bypasses RLS). If that is not set, it uses `SUPABASE_KEY`. The anon key often cannot insert into `products` because of row-level security; use the **service_role** key from Supabase Dashboard → Project Settings → API → `service_role` (secret).
+
 ## GitHub Actions (daily + manual)
 
 The workflow [`.github/workflows/scrape.yml`](.github/workflows/scrape.yml) runs the full scraper:
@@ -75,12 +77,13 @@ The workflow [`.github/workflows/scrape.yml`](.github/workflows/scrape.yml) runs
 
 **Required secrets** (repo **Settings → Secrets and variables → Actions**):
 
-| Name            | Value           |
-|-----------------|-----------------|
-| `SUPABASE_URL`  | Your Supabase project URL |
-| `SUPABASE_KEY`  | Your Supabase anon/service key |
+| Name                           | Value |
+|--------------------------------|-------|
+| `SUPABASE_URL`                 | Your Supabase project URL |
+| `SUPABASE_SERVICE_ROLE_KEY`    | **Recommended.** Service role key (Dashboard → Project Settings → API → `service_role`). Needed for inserting into `products` when RLS is enabled. |
+| `SUPABASE_KEY`                | Fallback if `SUPABASE_SERVICE_ROLE_KEY` is not set (e.g. anon key; only works if RLS allows that role to insert). |
 
-Add both, then the scheduled and manual runs will use them. If a run fails, the **scraper.log** is uploaded as an artifact for that run.
+Set `SUPABASE_SERVICE_ROLE_KEY` so scheduled and manual runs can write to the database. If a run fails, the **scraper.log** is uploaded as an artifact for that run.
 
 ## Usage
 
