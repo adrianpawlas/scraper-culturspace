@@ -27,20 +27,8 @@ import torch
 from transformers import SiglipImageProcessor, SiglipModel, SiglipTokenizer
 from PIL import Image
 import numpy as np
-_supabase_client = None
 
-def _get_supabase_client(url: str, key: str):
-    """Use Supabase client if available; else None (caller uses REST fallback)."""
-    global _supabase_client
-    if _supabase_client is not None:
-        return _supabase_client
-    try:
-        from supabase import create_client
-        _supabase_client = create_client(url, key)
-        return _supabase_client
-    except Exception:
-        return None
-
+from db import SupabaseREST
 from tqdm import tqdm
 import re
 
@@ -76,7 +64,7 @@ class CulturSpaceScraper:
 
     BASE_URL = "https://culturspace.com"
     SHOP_ALL_URL = "https://culturspace.com/collections/shop-all"
-    SOURCE = "scraper"
+    SOURCE = "culturspace"  # Unique per scraper - do not share with other scrapers
     BRAND = "Cultur Space"
     GENDER = "MAN"
     SECOND_HAND = False
@@ -84,7 +72,7 @@ class CulturSpaceScraper:
     def __init__(self, supabase_url: str, supabase_key: str):
         self._supabase_url = supabase_url.rstrip("/")
         self._supabase_key = supabase_key
-        self._supabase = _get_supabase_client(supabase_url, supabase_key)
+        self.db = SupabaseREST(supabase_url, supabase_key)
         self.session = requests.Session()
         self.session.headers.update({
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
@@ -898,93 +886,73 @@ class CulturSpaceScraper:
             logger.error(f"Error generating text embedding: {e}")
             return None
 
-    def save_to_supabase(self, product_data: ProductData) -> bool:
-        """Save product data to Supabase"""
-        try:
-            # Stable unique ID from source + product_url
-            raw = f"{self.SOURCE}|{product_data.product_url}"
-            product_id = f"cultur_space_{hashlib.md5(raw.encode()).hexdigest()[:16]}"
+    def _format_product_for_db(self, product_data: ProductData) -> Dict:
+        """Build product dict for Supabase (same keys required across batch)."""
+        raw = f"{self.SOURCE}:{product_data.product_url}"
+        product_id = hashlib.sha256(raw.encode()).hexdigest()
 
-            data = {
-                'id': product_id,
-                'source': self.SOURCE,
-                'product_url': product_data.product_url,
-                'image_url': product_data.image_url,
-                'brand': self.BRAND,
-                'title': product_data.title,
-                'description': product_data.description,
-                'category': product_data.category,
-                'gender': self.GENDER,
-                'second_hand': self.SECOND_HAND,
-                'image_embedding': product_data.image_embedding,
-                'info_embedding': product_data.info_embedding,
-                'price': product_data.price,
-                'sale': product_data.sale,
-                'metadata': product_data.metadata,
-                'size': product_data.size,
-                'additional_images': product_data.additional_images,
-            }
-
-            if self._supabase is not None:
-                self._supabase.table('products').upsert(
-                    data, on_conflict='source,product_url'
-                ).execute()
-            else:
-                # REST fallback when supabase client fails (e.g. websockets.asyncio)
-                rest_url = f"{self._supabase_url}/rest/v1/products"
-                headers = {
-                    "apikey": self._supabase_key,
-                    "Authorization": f"Bearer {self._supabase_key}",
-                    "Content-Type": "application/json",
-                    "Prefer": "resolution=merge-duplicates,return=minimal",
-                }
-                resp = self.session.post(
-                    f"{rest_url}?on_conflict=source,product_url",
-                    headers=headers,
-                    json=data,
-                    timeout=30,
-                )
-                resp.raise_for_status()
-
-            logger.info(f"Successfully saved product: {product_data.title}")
-            return True
-
-        except Exception as e:
-            logger.error(f"Error saving to Supabase: {e}")
-            return False
+        return {
+            "id": product_id,
+            "source": self.SOURCE,
+            "product_url": product_data.product_url,
+            "image_url": product_data.image_url,
+            "brand": self.BRAND,
+            "title": product_data.title,
+            "description": product_data.description,
+            "category": product_data.category,
+            "gender": self.GENDER,
+            "second_hand": self.SECOND_HAND,
+            "image_embedding": product_data.image_embedding,
+            "info_embedding": product_data.info_embedding,
+            "price": product_data.price,
+            "sale": product_data.sale,
+            "metadata": product_data.metadata,
+            "size": product_data.size,
+            "additional_images": product_data.additional_images,
+        }
 
     def run(self):
-        """Main execution method"""
+        """Main execution method: scrape all, batch upsert (insert new only), remove discontinued."""
         logger.info("Starting Cultur Space scraper")
 
         try:
-            # Get all product URLs
             product_urls = self.get_product_urls()
             logger.info(f"Found {len(product_urls)} products to scrape")
 
-            # Scrape each product
-            successful = 0
+            # Collect all scraped products (don't save one-by-one)
+            products: List[Dict] = []
             failed = 0
 
             for url in tqdm(product_urls, desc="Scraping products"):
                 try:
                     product_data = self.scrape_product_page(url)
                     if product_data:
-                        if self.save_to_supabase(product_data):
-                            successful += 1
-                        else:
-                            failed += 1
+                        products.append(self._format_product_for_db(product_data))
                     else:
                         failed += 1
-
-                    # Small delay to be respectful
                     time.sleep(1)
-
                 except Exception as e:
                     logger.error(f"Failed to process {url}: {e}")
                     failed += 1
 
-            logger.info(f"Scraping completed. Successful: {successful}, Failed: {failed}")
+            logger.info(f"Scraped {len(products)} products, {failed} failed")
+
+            # Batch import: insert new products only (don't overwrite existing)
+            if products:
+                try:
+                    self.db.upsert_products(products, ignore_existing=True)
+                    logger.info(f"Upserted {len(products)} products to Supabase")
+                except Exception as e:
+                    logger.error(f"Import failed: {e}")
+                    raise
+
+                # Smart sync: remove products no longer in catalog
+                current_ids = [p["id"] for p in products]
+                deleted = self.db.delete_missing_for_source(self.SOURCE, current_ids)
+                if deleted > 0:
+                    logger.info(f"Removed {deleted} discontinued products from database")
+
+            logger.info("Scraping completed")
 
         finally:
             self._cleanup_selenium()

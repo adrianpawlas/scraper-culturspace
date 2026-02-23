@@ -5,10 +5,18 @@ Run the full Cultur Space scraper with embeddings
 
 import os
 import sys
-import logging
 
 # Add current directory to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, _script_dir)
+os.chdir(_script_dir)
+
+# Load .env from script directory (critical for scheduled/cron runs where cwd may differ)
+try:
+    from dotenv import load_dotenv
+    load_dotenv(os.path.join(_script_dir, ".env"), override=False)
+except ImportError:
+    pass
 
 def main():
     """Main entry point for full scraper"""

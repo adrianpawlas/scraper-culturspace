@@ -31,6 +31,7 @@ def test_scraper():
     logger.info("Starting Cultur Space scraper test")
 
     scraper = CulturSpaceScraper(SUPABASE_URL, SUPABASE_KEY)
+    products = []
 
     try:
         successful_tests = 0
@@ -48,17 +49,23 @@ def test_scraper():
                     logger.info(f"  - Image embedding dimension: {len(product_data.image_embedding) if product_data.image_embedding else 0}")
                     logger.info(f"  - Info embedding dimension: {len(product_data.info_embedding) if product_data.info_embedding else 0}")
 
-                    # Test saving to Supabase
-                    if scraper.save_to_supabase(product_data):
-                        logger.info("  [OK] Successfully saved to Supabase")
-                        successful_tests += 1
-                    else:
-                        logger.error("  [FAIL] Failed to save to Supabase")
+                    # Collect for batch upsert (matches new flow)
+                    products.append(scraper._format_product_for_db(product_data))
+                    successful_tests += 1
                 else:
                     logger.error("  [FAIL] Failed to scrape product data")
 
             except Exception as e:
                 logger.error(f"  [FAIL] Error testing {url}: {e}")
+
+        # Batch upsert to Supabase (skip delete_missing for partial test)
+        if products:
+            try:
+                scraper.db.upsert_products(products, ignore_existing=True)
+                logger.info("  [OK] Batch upsert to Supabase succeeded")
+            except Exception as e:
+                logger.error(f"  [FAIL] Supabase upsert failed: {e}")
+                successful_tests = 0
 
         logger.info(f"Test completed. {successful_tests}/{len(test_urls)} products processed successfully")
 
