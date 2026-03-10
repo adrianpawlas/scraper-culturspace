@@ -64,7 +64,7 @@ class CulturSpaceScraper:
 
     BASE_URL = "https://culturspace.com"
     SHOP_ALL_URL = "https://culturspace.com/collections/shop-all"
-    SOURCE = "culturspace"  # Unique per scraper - do not share with other scrapers
+    SOURCE = "scraper-culturspace"  # Unique per scraper - do not share with other scrapers
     BRAND = "Cultur Space"
     GENDER = "MAN"
     SECOND_HAND = False
