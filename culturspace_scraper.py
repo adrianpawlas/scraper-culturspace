@@ -886,8 +886,13 @@ class CulturSpaceScraper:
             logger.error(f"Error generating text embedding: {e}")
             return None
 
-    def _format_product_for_db(self, product_data: ProductData) -> Dict:
-        """Build product dict for Supabase (same keys required across batch)."""
+    def _format_product_for_db(self, product_data: ProductData, generate_embeddings: bool = True) -> Optional[Dict]:
+        """Build product dict for Supabase (same keys required across batch).
+        
+        Args:
+            product_data: The scraped product data
+            generate_embeddings: If True, generate embeddings. If False, set to None.
+        """
         raw = f"{self.SOURCE}:{product_data.product_url}"
         product_id = hashlib.sha256(raw.encode()).hexdigest()
 
@@ -902,56 +907,153 @@ class CulturSpaceScraper:
             "category": product_data.category,
             "gender": self.GENDER,
             "second_hand": self.SECOND_HAND,
-            "image_embedding": product_data.image_embedding,
-            "info_embedding": product_data.info_embedding,
+            "image_embedding": product_data.image_embedding if generate_embeddings else None,
+            "info_embedding": product_data.info_embedding if generate_embeddings else None,
             "price": product_data.price,
             "sale": product_data.sale,
             "metadata": product_data.metadata,
             "size": product_data.size,
             "additional_images": product_data.additional_images,
+            "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime()),
         }
 
+    def _needs_embedding_regeneration(self, product_url: str) -> Tuple[bool, Optional[Dict]]:
+        """Check if embeddings need to be regenerated for a product.
+        
+        Returns:
+            Tuple of (needs_regeneration, existing_product_dict)
+            - needs_regeneration: True if product is new
+            - existing_product_dict: The existing product data if found, None otherwise
+        """
+        existing_products = self.db.get_products_for_source(self.SOURCE)
+        existing_by_url = {p["product_url"]: p for p in existing_products}
+        
+        existing = existing_by_url.get(product_url)
+        if existing is None:
+            return True, None
+        
+        return False, existing
+
+    def _check_product_changed_quick(self, url: str, existing: Optional[Dict]) -> bool:
+        """Quick check if product has changed using Shopify product JSON API.
+        
+        Returns True if product is new, changed, or we can't determine.
+        Returns False if product definitely unchanged.
+        """
+        if not existing:
+            return True
+        
+        try:
+            handle = None
+            if '/products/' in url:
+                handle = url.split('/products/')[-1].split('?')[0].strip('/')
+            if not handle:
+                return True
+            
+            js_url = f"{self.BASE_URL}/products/{handle}.js"
+            response = self.session.get(js_url, timeout=10)
+            if not response.ok:
+                return True
+            
+            data = response.json()
+            variants = data.get('variants') or []
+            if not variants:
+                return True
+            
+            variant = variants[0]
+            current_price = variant.get('price')
+            existing_price = existing.get('price', '')
+            
+            if current_price and str(current_price) != existing_price:
+                return True
+            
+            images = data.get('images') or []
+            if images:
+                current_image = images[0].get('src') if isinstance(images[0], dict) else images[0]
+                existing_image = existing.get('image_url', '')
+                if current_image != existing_image:
+                    return True
+            
+            return False
+        except Exception:
+            return True
+
+    def _scrape_product_with_smart_embeddings(self, url: str) -> Optional[ProductData]:
+        """Scrape product with smart embedding generation.
+        
+        Only generates embeddings if product is new or image URL changed.
+        Skips entirely if product unchanged.
+        """
+        is_new_product, existing = self._needs_embedding_regeneration(url)
+        
+        if existing and not self._check_product_changed_quick(url, existing):
+            logger.info(f"Product unchanged, skipping entirely: {url}")
+            return None
+        
+        product_data = self.scrape_product_page(url)
+        
+        if product_data and existing:
+            new_image_url = product_data.image_url
+            existing_image_url = existing.get("image_url", "")
+            if new_image_url == existing_image_url:
+                product_data.image_embedding = existing.get("image_embedding")
+                product_data.info_embedding = existing.get("info_embedding")
+                logger.info(f"Image unchanged, reusing existing embeddings: {url}")
+        
+        if product_data:
+            time.sleep(0.5)
+            
+        return product_data
+
     def run(self):
-        """Main execution method: scrape all, batch upsert (insert new only), remove discontinued."""
+        """Main execution method: scrape all, smart upsert, remove stale, print summary."""
         logger.info("Starting Cultur Space scraper")
 
         try:
+            current_run = self.db.get_current_run_number(self.SOURCE)
+            logger.info(f"Current run number: {current_run}")
+
             product_urls = self.get_product_urls()
             logger.info(f"Found {len(product_urls)} products to scrape")
 
-            # Collect all scraped products (don't save one-by-one)
             products: List[Dict] = []
             failed = 0
 
             for url in tqdm(product_urls, desc="Scraping products"):
                 try:
-                    product_data = self.scrape_product_page(url)
+                    product_data = self._scrape_product_with_smart_embeddings(url)
                     if product_data:
                         products.append(self._format_product_for_db(product_data))
                     else:
                         failed += 1
-                    time.sleep(1)
                 except Exception as e:
                     logger.error(f"Failed to process {url}: {e}")
                     failed += 1
 
             logger.info(f"Scraped {len(products)} products, {failed} failed")
 
-            # Batch import: insert new products only (don't overwrite existing)
             if products:
                 try:
-                    self.db.upsert_products(products, ignore_existing=True)
-                    logger.info(f"Upserted {len(products)} products to Supabase")
+                    stats = self.db.smart_upsert_products(products, self.SOURCE, current_run)
+                    logger.info(f"Upsert stats: {stats}")
                 except Exception as e:
                     logger.error(f"Import failed: {e}")
                     raise
 
-                # Smart sync: remove products no longer in catalog
-                current_ids = [p["id"] for p in products]
-                deleted = self.db.delete_missing_for_source(self.SOURCE, current_ids)
-                if deleted > 0:
-                    logger.info(f"Removed {deleted} discontinued products from database")
+                stale_deleted = self.db.delete_stale_products(self.SOURCE, current_run)
+                logger.info(f"Deleted {stale_deleted} stale products")
 
+            logger.info("=" * 50)
+            logger.info("SCRAPER RUN SUMMARY")
+            logger.info("=" * 50)
+            logger.info(f"Products scraped: {len(product_urls)}")
+            logger.info(f"Products failed to scrape: {failed}")
+            if products:
+                logger.info(f"New products added: {stats.get('new_count', 0)}")
+                logger.info(f"Products updated: {stats.get('updated_count', 0)}")
+                logger.info(f"Products unchanged (skipped): {stats.get('unchanged_count', 0)}")
+                logger.info(f"Stale products deleted: {stale_deleted}")
+            logger.info("=" * 50)
             logger.info("Scraping completed")
 
         finally:
